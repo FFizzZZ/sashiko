@@ -829,7 +829,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(async move {
         info!("Background historical data compression worker started");
         loop {
-            match compression_db.compress_legacy_batch(500).await {
+            match compression_db.compress_legacy_batch(50).await {
                 Ok(0) => {
                     info!(
                         "Historical data compression is 100% complete across all database tables (reviews, messages, patches, ai_interactions, patchsets). Background compression worker sleeping for 24 hours."

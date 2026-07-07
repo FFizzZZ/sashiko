@@ -4148,45 +4148,24 @@ impl Database {
         Ok(())
     }
 
-    async fn get_compression_cursor_str(&self, key: &str) -> String {
-        let mut rows = match self
-            .conn
-            .query(
-                "SELECT value FROM app_metadata WHERE key = ?",
-                libsql::params![key],
-            )
-            .await
-        {
-            Ok(r) => r,
-            Err(_) => return String::new(),
-        };
-        if let Ok(Some(row)) = rows.next().await
-            && let Ok(s) = row.get::<String>(0)
-        {
-            return s;
-        }
-        String::new()
-    }
-
-    async fn set_compression_cursor_str(&self, key: &str, val: &str) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO app_metadata (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            libsql::params![key, val],
-        ).await?;
-        Ok(())
-    }
-
     /// Incremental batch compressor designed for background execution inside `sashiko`.
     /// Scans up to `limit` rows starting from the last checked rowid in `app_metadata` (`WHERE id > last_id ORDER BY id LIMIT limit`).
     /// Compresses any legacy uncompressed strings (`typeof(col) = 'text'`) and updates them inside `BEGIN IMMEDIATE ... COMMIT`.
     /// Returns the number of rows scanned in this batch (`0` when all 5 tables reach the very end of their IDs).
+    /// Incremental batch compressor designed for background execution inside `sashiko`.
+    /// Scans up to `limit` rows starting from the last checked rowid in `app_metadata`.
+    /// Compresses any legacy uncompressed strings (`typeof(col) = 'text'`) and updates them inside `BEGIN IMMEDIATE ... COMMIT`.
+    /// Returns the number of rows compressed in this batch (`0` when all 5 tables reach the end and have no remaining uncompressed rows).
     pub async fn compress_legacy_batch(&self, limit: usize) -> Result<usize> {
         // 1. Check reviews
         let last_id = self
             .get_compression_cursor("compression_last_id_reviews")
             .await;
         let mut rows = self.conn.query(
-            &format!("SELECT id, logs, inline_review FROM reviews WHERE id > {} ORDER BY id LIMIT {}", last_id, limit),
+            &format!(
+                "SELECT id, logs, inline_review FROM reviews WHERE id > {} AND ((typeof(logs) = 'text' AND logs IS NOT NULL) OR (typeof(inline_review) = 'text' AND inline_review IS NOT NULL)) ORDER BY id LIMIT {}",
+                last_id, limit
+            ),
             ()
         ).await?;
         let mut batch_reviews = Vec::new();
@@ -4211,30 +4190,48 @@ impl Database {
             batch_reviews.push((id, logs, inline));
         }
         if !batch_reviews.is_empty() {
-            let scanned = batch_reviews.len();
-            let mut to_update = Vec::new();
-            for (id, logs, inline) in batch_reviews {
-                if logs.is_some() || inline.is_some() {
-                    to_update.push((id, logs, inline));
-                }
-            }
-            if !to_update.is_empty() {
-                self.conn.execute("BEGIN IMMEDIATE", ()).await?;
-                for (id, logs, inline) in to_update {
+            let migrated = batch_reviews.len();
+            let compressed_updates = tokio::task::spawn_blocking(move || {
+                let mut res = Vec::with_capacity(batch_reviews.len());
+                for (id, logs, inline) in batch_reviews {
                     let logs_val = Self::compress_opt_text(logs.as_deref());
                     let inline_val = Self::compress_opt_text(inline.as_deref());
-                    self.conn
-                        .execute(
-                            "UPDATE reviews SET logs = ?, inline_review = ? WHERE id = ?",
-                            libsql::params![logs_val, inline_val, id],
-                        )
-                        .await?;
+                    res.push((id, logs_val, inline_val));
                 }
-                self.conn.execute("COMMIT", ()).await?;
+                res
+            })
+            .await
+            .unwrap();
+
+            self.conn.execute("BEGIN IMMEDIATE", ()).await?;
+            for (id, logs_val, inline_val) in compressed_updates {
+                self.conn
+                    .execute(
+                        "UPDATE reviews SET logs = CASE WHEN typeof(logs) = 'text' THEN ? ELSE logs END, inline_review = CASE WHEN typeof(inline_review) = 'text' THEN ? ELSE inline_review END WHERE id = ? AND (typeof(logs) = 'text' OR typeof(inline_review) = 'text')",
+                        libsql::params![logs_val, inline_val, id],
+                    )
+                    .await?;
             }
+            self.conn.execute("COMMIT", ()).await?;
             self.set_compression_cursor("compression_last_id_reviews", max_id)
                 .await?;
-            return Ok(scanned);
+            return Ok(migrated);
+        } else {
+            let max_table_id = match self.conn.query("SELECT MAX(id) FROM reviews", ()).await {
+                Ok(mut r) => {
+                    if let Ok(Some(row)) = r.next().await {
+                        row.get::<Option<i64>>(0).ok().flatten().unwrap_or(-1)
+                    } else {
+                        -1
+                    }
+                }
+                Err(_) => -1,
+            };
+            if max_table_id > last_id {
+                let _ = self
+                    .set_compression_cursor("compression_last_id_reviews", max_table_id)
+                    .await;
+            }
         }
 
         // 2. Check messages
@@ -4245,7 +4242,7 @@ impl Database {
             .conn
             .query(
                 &format!(
-                    "SELECT id, body FROM messages WHERE id > {} ORDER BY id LIMIT {}",
+                    "SELECT id, body FROM messages WHERE id > {} AND (typeof(body) = 'text' AND body IS NOT NULL) ORDER BY id LIMIT {}",
                     last_id, limit
                 ),
                 (),
@@ -4269,29 +4266,48 @@ impl Database {
             batch_messages.push((id, body));
         }
         if !batch_messages.is_empty() {
-            let scanned = batch_messages.len();
-            let mut to_update = Vec::new();
-            for (id, body) in batch_messages {
-                if let Some(s) = body {
-                    to_update.push((id, s));
+            let migrated = batch_messages.len();
+            let compressed_updates = tokio::task::spawn_blocking(move || {
+                let mut res = Vec::with_capacity(batch_messages.len());
+                for (id, body) in batch_messages {
+                    if let Some(s) = body {
+                        res.push((id, Self::compress_str_to_value(&s)));
+                    }
                 }
+                res
+            })
+            .await
+            .unwrap();
+
+            self.conn.execute("BEGIN IMMEDIATE", ()).await?;
+            for (id, body_val) in compressed_updates {
+                self.conn
+                    .execute(
+                        "UPDATE messages SET body = ? WHERE id = ? AND typeof(body) = 'text'",
+                        libsql::params![body_val, id],
+                    )
+                    .await?;
             }
-            if !to_update.is_empty() {
-                self.conn.execute("BEGIN IMMEDIATE", ()).await?;
-                for (id, body) in to_update {
-                    let body_val = Self::compress_str_to_value(&body);
-                    self.conn
-                        .execute(
-                            "UPDATE messages SET body = ? WHERE id = ?",
-                            libsql::params![body_val, id],
-                        )
-                        .await?;
-                }
-                self.conn.execute("COMMIT", ()).await?;
-            }
+            self.conn.execute("COMMIT", ()).await?;
             self.set_compression_cursor("compression_last_id_messages", max_id)
                 .await?;
-            return Ok(scanned);
+            return Ok(migrated);
+        } else {
+            let max_table_id = match self.conn.query("SELECT MAX(id) FROM messages", ()).await {
+                Ok(mut r) => {
+                    if let Ok(Some(row)) = r.next().await {
+                        row.get::<Option<i64>>(0).ok().flatten().unwrap_or(-1)
+                    } else {
+                        -1
+                    }
+                }
+                Err(_) => -1,
+            };
+            if max_table_id > last_id {
+                let _ = self
+                    .set_compression_cursor("compression_last_id_messages", max_table_id)
+                    .await;
+            }
         }
 
         // 3. Check patches
@@ -4302,7 +4318,7 @@ impl Database {
             .conn
             .query(
                 &format!(
-                    "SELECT id, diff FROM patches WHERE id > {} ORDER BY id LIMIT {}",
+                    "SELECT id, diff FROM patches WHERE id > {} AND (typeof(diff) = 'text' AND diff IS NOT NULL) ORDER BY id LIMIT {}",
                     last_id, limit
                 ),
                 (),
@@ -4326,80 +4342,136 @@ impl Database {
             batch_patches.push((id, diff));
         }
         if !batch_patches.is_empty() {
-            let scanned = batch_patches.len();
-            let mut to_update = Vec::new();
-            for (id, diff) in batch_patches {
-                if let Some(s) = diff {
-                    to_update.push((id, s));
+            let migrated = batch_patches.len();
+            let compressed_updates = tokio::task::spawn_blocking(move || {
+                let mut res = Vec::with_capacity(batch_patches.len());
+                for (id, diff) in batch_patches {
+                    if let Some(s) = diff {
+                        res.push((id, Self::compress_str_to_value(&s)));
+                    }
                 }
+                res
+            })
+            .await
+            .unwrap();
+
+            self.conn.execute("BEGIN IMMEDIATE", ()).await?;
+            for (id, diff_val) in compressed_updates {
+                self.conn
+                    .execute(
+                        "UPDATE patches SET diff = ? WHERE id = ? AND typeof(diff) = 'text'",
+                        libsql::params![diff_val, id],
+                    )
+                    .await?;
             }
-            if !to_update.is_empty() {
-                self.conn.execute("BEGIN IMMEDIATE", ()).await?;
-                for (id, diff) in to_update {
-                    let diff_val = Self::compress_str_to_value(&diff);
-                    self.conn
-                        .execute(
-                            "UPDATE patches SET diff = ? WHERE id = ?",
-                            libsql::params![diff_val, id],
-                        )
-                        .await?;
-                }
-                self.conn.execute("COMMIT", ()).await?;
-            }
+            self.conn.execute("COMMIT", ()).await?;
             self.set_compression_cursor("compression_last_id_patches", max_id)
                 .await?;
-            return Ok(scanned);
+            return Ok(migrated);
+        } else {
+            let max_table_id = match self.conn.query("SELECT MAX(id) FROM patches", ()).await {
+                Ok(mut r) => {
+                    if let Ok(Some(row)) = r.next().await {
+                        row.get::<Option<i64>>(0).ok().flatten().unwrap_or(-1)
+                    } else {
+                        -1
+                    }
+                }
+                Err(_) => -1,
+            };
+            if max_table_id > last_id {
+                let _ = self
+                    .set_compression_cursor("compression_last_id_patches", max_table_id)
+                    .await;
+            }
         }
 
-        // 4. Check ai_interactions
-        let last_id = self
-            .get_compression_cursor_str("compression_last_id_ai_interactions")
+        // 4. Check ai_interactions (using _rowid_ to avoid string ID ordering traps)
+        let last_rowid = self
+            .get_compression_cursor("compression_last_rowid_ai_interactions")
             .await;
         let mut rows = self.conn.query(
-            &format!("SELECT id, output_raw FROM ai_interactions WHERE id > '{}' ORDER BY id LIMIT {}", last_id, limit),
+            &format!("SELECT _rowid_, id, input_context, output_raw FROM ai_interactions WHERE _rowid_ > {} AND ((typeof(input_context) = 'text' AND input_context IS NOT NULL) OR (typeof(output_raw) = 'text' AND output_raw IS NOT NULL)) ORDER BY _rowid_ LIMIT {}", last_rowid, limit),
             ()
         ).await?;
         let mut batch_ai = Vec::new();
-        let mut max_id = last_id.clone();
+        let mut max_rowid = last_rowid;
         while let Ok(Some(row)) = rows.next().await {
-            let id: String = match row.get_value(0) {
+            let rowid: i64 = match row.get_value(0) {
+                Ok(libsql::Value::Integer(i)) => i,
+                Ok(libsql::Value::Text(s)) => s.parse().unwrap_or(0),
+                _ => continue,
+            };
+            if rowid > max_rowid {
+                max_rowid = rowid;
+            }
+            let id: String = match row.get_value(1) {
                 Ok(libsql::Value::Text(s)) => s,
                 Ok(libsql::Value::Integer(i)) => i.to_string(),
                 _ => continue,
             };
-            if id > max_id {
-                max_id = id.clone();
-            }
-            let output: Option<String> = match row.get_value(1) {
+            let input: Option<String> = match row.get_value(2) {
                 Ok(libsql::Value::Text(s)) => Some(s),
                 _ => None,
             };
-            batch_ai.push((id, output));
+            let output: Option<String> = match row.get_value(3) {
+                Ok(libsql::Value::Text(s)) => Some(s),
+                _ => None,
+            };
+            batch_ai.push((rowid, id, input, output));
         }
         if !batch_ai.is_empty() {
-            let scanned = batch_ai.len();
-            let mut to_update = Vec::new();
-            for (id, output) in batch_ai {
-                if let Some(s) = output {
-                    to_update.push((id, s));
+            let migrated = batch_ai.len();
+            let compressed_updates = tokio::task::spawn_blocking(move || {
+                let mut res = Vec::with_capacity(batch_ai.len());
+                for (_rowid, id, input, output) in batch_ai {
+                    res.push((
+                        id,
+                        Self::compress_opt_text(input.as_deref()),
+                        Self::compress_opt_text(output.as_deref()),
+                    ));
                 }
+                res
+            })
+            .await
+            .unwrap();
+
+            self.conn.execute("BEGIN IMMEDIATE", ()).await?;
+            for (id, input_val, output_val) in compressed_updates {
+                self.conn
+                    .execute(
+                        "UPDATE ai_interactions SET input_context = CASE WHEN typeof(input_context) = 'text' THEN ? ELSE input_context END, output_raw = CASE WHEN typeof(output_raw) = 'text' THEN ? ELSE output_raw END WHERE id = ? AND (typeof(input_context) = 'text' OR typeof(output_raw) = 'text')",
+                        libsql::params![input_val, output_val, id],
+                    )
+                    .await?;
             }
-            if !to_update.is_empty() {
-                self.conn.execute("BEGIN IMMEDIATE", ()).await?;
-                for (id, output) in to_update {
-                    let output_val = Self::compress_str_to_value(&output);
-                    self.conn
-                        .execute(
-                            "UPDATE ai_interactions SET output_raw = ? WHERE id = ?",
-                            libsql::params![output_val, id],
-                        )
-                        .await?;
-                }
-                self.conn.execute("COMMIT", ()).await?;
-            }
-            self.set_compression_cursor_str("compression_last_id_ai_interactions", &max_id)
+            self.conn.execute("COMMIT", ()).await?;
+            self.set_compression_cursor("compression_last_rowid_ai_interactions", max_rowid)
                 .await?;
-            return Ok(scanned);
+            return Ok(migrated);
+        } else {
+            let max_table_rowid = match self
+                .conn
+                .query("SELECT MAX(_rowid_) FROM ai_interactions", ())
+                .await
+            {
+                Ok(mut r) => {
+                    if let Ok(Some(row)) = r.next().await {
+                        row.get::<Option<i64>>(0).ok().flatten().unwrap_or(-1)
+                    } else {
+                        -1
+                    }
+                }
+                Err(_) => -1,
+            };
+            if max_table_rowid > last_rowid {
+                let _ = self
+                    .set_compression_cursor(
+                        "compression_last_rowid_ai_interactions",
+                        max_table_rowid,
+                    )
+                    .await;
+            }
         }
 
         // 5. Check patchsets
@@ -4410,7 +4482,7 @@ impl Database {
             .conn
             .query(
                 &format!(
-                    "SELECT id, baseline_logs FROM patchsets WHERE id > {} ORDER BY id LIMIT {}",
+                    "SELECT id, baseline_logs FROM patchsets WHERE id > {} AND (typeof(baseline_logs) = 'text' AND baseline_logs IS NOT NULL) ORDER BY id LIMIT {}",
                     last_id, limit
                 ),
                 (),
@@ -4434,67 +4506,54 @@ impl Database {
             batch_patchsets.push((id, logs));
         }
         if !batch_patchsets.is_empty() {
-            let scanned = batch_patchsets.len();
-            let mut to_update = Vec::new();
-            for (id, logs) in batch_patchsets {
-                if let Some(s) = logs {
-                    to_update.push((id, s));
+            let migrated = batch_patchsets.len();
+            let compressed_updates = tokio::task::spawn_blocking(move || {
+                let mut res = Vec::with_capacity(batch_patchsets.len());
+                for (id, logs) in batch_patchsets {
+                    if let Some(s) = logs {
+                        res.push((id, Self::compress_str_to_value(&s)));
+                    }
                 }
+                res
+            })
+            .await
+            .unwrap();
+
+            self.conn.execute("BEGIN IMMEDIATE", ()).await?;
+            for (id, logs_val) in compressed_updates {
+                self.conn
+                    .execute(
+                        "UPDATE patchsets SET baseline_logs = ? WHERE id = ? AND typeof(baseline_logs) = 'text'",
+                        libsql::params![logs_val, id],
+                    )
+                    .await?;
             }
-            if !to_update.is_empty() {
-                self.conn.execute("BEGIN IMMEDIATE", ()).await?;
-                for (id, logs) in to_update {
-                    let logs_val = Self::compress_str_to_value(&logs);
-                    self.conn
-                        .execute(
-                            "UPDATE patchsets SET baseline_logs = ? WHERE id = ?",
-                            libsql::params![logs_val, id],
-                        )
-                        .await?;
-                }
-                self.conn.execute("COMMIT", ()).await?;
-            }
+            self.conn.execute("COMMIT", ()).await?;
             self.set_compression_cursor("compression_last_id_patchsets", max_id)
                 .await?;
-            return Ok(scanned);
+            return Ok(migrated);
+        } else {
+            let max_table_id = match self.conn.query("SELECT MAX(id) FROM patchsets", ()).await {
+                Ok(mut r) => {
+                    if let Ok(Some(row)) = r.next().await {
+                        row.get::<Option<i64>>(0).ok().flatten().unwrap_or(-1)
+                    } else {
+                        -1
+                    }
+                }
+                Err(_) => -1,
+            };
+            if max_table_id > last_id {
+                let _ = self
+                    .set_compression_cursor("compression_last_id_patchsets", max_table_id)
+                    .await;
+            }
         }
 
         tracing::info!(
             "Database historical data background compression check complete. All legacy rows across all 5 tables are compressed."
         );
         Ok(0)
-    }
-
-    pub async fn compress_legacy_reviews(&self, batch_size: usize) -> Result<usize> {
-        let mut total = 0;
-        loop {
-            let n = self.compress_legacy_batch(batch_size).await?;
-            if n == 0 {
-                break;
-            }
-            total += n;
-        }
-        Ok(total)
-    }
-
-    pub async fn compress_legacy_messages(&self, batch_size: usize) -> Result<usize> {
-        self.compress_legacy_reviews(batch_size).await
-    }
-
-    pub async fn compress_legacy_patches(&self, batch_size: usize) -> Result<usize> {
-        self.compress_legacy_reviews(batch_size).await
-    }
-
-    pub async fn compress_legacy_ai_interactions(&self, batch_size: usize) -> Result<usize> {
-        self.compress_legacy_reviews(batch_size).await
-    }
-
-    pub async fn compress_legacy_patchsets(&self, batch_size: usize) -> Result<usize> {
-        self.compress_legacy_reviews(batch_size).await
-    }
-
-    pub async fn compress_legacy_data(&self, batch_size: usize) -> Result<usize> {
-        self.compress_legacy_reviews(batch_size).await
     }
 
     pub async fn vacuum(&self) -> Result<()> {
@@ -6843,11 +6902,11 @@ mod tests {
             assert_eq!(r.get::<String>(1).unwrap(), "text");
         }
 
-        let migrated = db.compress_legacy_data(100).await.unwrap();
-        assert_eq!(
-            migrated, 5,
-            "Expected 5 rows to be migrated across 5 tables"
-        );
+        let mut migrated = 0;
+        while db.compress_legacy_batch(100).await.unwrap() > 0 {
+            migrated += 1;
+        }
+        assert!(migrated >= 1);
 
         {
             let r = db
@@ -6876,5 +6935,70 @@ mod tests {
         }
 
         db.vacuum().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_compress_legacy_batch_incremental_and_isolation() {
+        let db = setup_db().await;
+
+        db.conn
+            .execute(
+                "INSERT INTO patchsets (id, status, date, baseline_logs) VALUES (1, 'Test', 100, 'uncompressed baseline log')",
+                (),
+            )
+            .await
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO reviews (id, patchset_id, status, created_at, provider, model, logs, inline_review) VALUES (1, 1, 'In Review', 100, 'test', 'test', 'review log 1', 'inline 1')",
+                (),
+            )
+            .await
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO messages (id, message_id, body) VALUES (1, 'msg_1', 'message body 1')",
+                (),
+            )
+            .await
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO ai_interactions (id, provider, model, input_context, output_raw) VALUES ('ai_z', 'test', 'test', 'in', 'output z')",
+                (),
+            )
+            .await
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO ai_interactions (id, provider, model, input_context, output_raw) VALUES ('ai_a', 'test', 'test', 'in', 'output a')",
+                (),
+            )
+            .await
+            .unwrap();
+
+        let batch_1 = db.compress_legacy_batch(100).await.unwrap();
+        assert_eq!(
+            batch_1, 1,
+            "Expected 1 review row to be compressed in first batch tick"
+        );
+
+        let batch_2 = db.compress_legacy_batch(100).await.unwrap();
+        assert_eq!(batch_2, 1, "Expected 1 message row to be compressed");
+
+        let batch_3 = db.compress_legacy_batch(100).await.unwrap();
+        assert_eq!(
+            batch_3, 2,
+            "Expected 2 ai_interactions rows to be compressed across cursor advancement"
+        );
+
+        let batch_4 = db.compress_legacy_batch(100).await.unwrap();
+        assert_eq!(batch_4, 1, "Expected 1 patchset row to be compressed");
+
+        let batch_5 = db.compress_legacy_batch(100).await.unwrap();
+        assert_eq!(
+            batch_5, 0,
+            "Expected 0 when all tables are completely checked and compressed"
+        );
     }
 }
