@@ -181,6 +181,40 @@ pub struct PatchworkOutboxRow {
 }
 
 impl Database {
+    /// Helper to read a string or decompressed Zlib blob from a `libsql::Row` column.
+    pub fn get_compressed_text(row: &libsql::Row, idx: i32) -> Option<String> {
+        match row.get_value(idx) {
+            Ok(libsql::Value::Text(s)) => Some(s),
+            Ok(libsql::Value::Blob(b)) => {
+                if let Ok(decompressed) = crate::utils::decompress_text(&b) {
+                    Some(decompressed)
+                } else {
+                    String::from_utf8(b).ok()
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Helper to compress an optional string slice into a `libsql::Value` for parameter binding.
+    pub fn compress_opt_text(s: Option<&str>) -> libsql::Value {
+        match s {
+            Some(t) => match crate::utils::compress_text(t) {
+                Ok(b) => libsql::Value::Blob(b),
+                Err(_) => libsql::Value::Text(t.to_string()),
+            },
+            None => libsql::Value::Null,
+        }
+    }
+
+    /// Helper to compress a string slice into a `libsql::Value` for parameter binding.
+    pub fn compress_str_to_value(s: &str) -> libsql::Value {
+        match crate::utils::compress_text(s) {
+            Ok(b) => libsql::Value::Blob(b),
+            Err(_) => libsql::Value::Text(s.to_string()),
+        }
+    }
+
     pub async fn get_oldest_message_timestamp(&self) -> Result<Option<i64>> {
         let mut rows = self
             .conn
@@ -212,12 +246,12 @@ impl Database {
                 row.get::<Option<String>>(4).ok().flatten(),
                 row.get::<Option<String>>(5).ok().flatten(),
                 row.get::<Option<i64>>(6).ok().flatten(),
-                row.get::<Option<String>>(7).ok().flatten(),
+                Self::get_compressed_text(&row, 7),
                 row.get::<Option<String>>(8).ok().flatten(),
                 row.get::<Option<String>>(9).ok().flatten(),
                 row.get::<Option<String>>(10).ok().flatten(),
                 row.get::<Option<String>>(11).ok().flatten(),
-                row.get::<Option<String>>(12).ok().flatten(),
+                Self::get_compressed_text(&row, 12),
                 row.get::<Option<String>>(13).ok().flatten(),
             ))
         } else {
@@ -358,7 +392,7 @@ impl Database {
             .await?;
 
         if let Ok(Some(row)) = rows.next().await {
-            let body: Option<String> = row.get(0).ok();
+            let body: Option<String> = Self::get_compressed_text(&row, 0);
             if let Some(b) = body
                 && !b.is_empty()
             {
@@ -789,10 +823,11 @@ impl Database {
         logs: Option<&str>,
     ) -> Result<()> {
         if let Some(l) = logs {
+            let compressed_logs = Self::compress_opt_text(Some(l));
             self.conn
                 .execute(
                     "UPDATE reviews SET status = ?, logs = ? WHERE id = ?",
-                    libsql::params![status, l, review_id],
+                    libsql::params![status, compressed_logs, review_id],
                 )
                 .await?;
         } else {
@@ -817,10 +852,12 @@ impl Database {
         inline_review: Option<&str>,
         logs: Option<&str>,
     ) -> Result<()> {
+        let compressed_inline = Self::compress_opt_text(inline_review);
+        let compressed_logs = Self::compress_opt_text(logs);
         self.conn
             .execute(
                 "UPDATE reviews SET status = ?, result_description = ?, summary = ?, interaction_id = ?, inline_review = ?, logs = ? WHERE id = ?",
-                libsql::params![status, result, summary, interaction_id, inline_review, logs, review_id],
+                libsql::params![status, result, summary, interaction_id, compressed_inline, compressed_logs, review_id],
             )
             .await?;
         Ok(())
@@ -836,8 +873,8 @@ impl Database {
                 params.workflow_id,
                 params.provider,
                 params.model,
-                params.input,
-                params.output,
+                Self::compress_str_to_value(params.input),
+                Self::compress_str_to_value(params.output),
                 params.tokens_in,
                 params.tokens_out,
                 params.tokens_cached,
@@ -903,7 +940,7 @@ impl Database {
 
         while let Ok(Some(row)) = rows.next().await {
             let review_id: i64 = row.get(0)?;
-            let logs: String = row.get(1)?;
+            let logs: String = Self::get_compressed_text(&row, 1).unwrap_or_default();
             let provider: String = row.get(2).unwrap_or_else(|_| "unknown".to_string());
             let model: String = row.get(3).unwrap_or_else(|_| "unknown".to_string());
 
@@ -988,7 +1025,7 @@ impl Database {
 
         while let Ok(Some(row)) = rows.next().await {
             let review_id: i64 = row.get(0)?;
-            let output_raw: String = row.get(1)?;
+            let output_raw: String = Self::get_compressed_text(&row, 1).unwrap_or_default();
 
             // Parse JSON and insert findings
             if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&output_raw)
@@ -1716,7 +1753,7 @@ impl Database {
                 git_blob_hash=excluded.git_blob_hash,
                 mailing_list=excluded.mailing_list,
                 references_hdr=excluded.references_hdr",
-            libsql::params![message_id, thread_id, in_reply_to, author, subject, date, body, to, cc, git_blob_hash, mailing_list, references_hdr],
+            libsql::params![message_id, thread_id, in_reply_to, author, subject, date, Self::compress_str_to_value(body), to, cc, git_blob_hash, mailing_list, references_hdr],
         ).await?;
         Ok(())
     }
@@ -2277,7 +2314,7 @@ impl Database {
                 patchset_id=excluded.patchset_id,
                 part_index=excluded.part_index,
                 diff=excluded.diff",
-            libsql::params![patchset_id, message_id, part_index, diff]
+            libsql::params![patchset_id, message_id, part_index, Self::compress_str_to_value(diff)]
         ).await?;
 
         // Update received_parts for the NEW patchset
@@ -2583,7 +2620,7 @@ impl Database {
                 author: row.get(4).ok(),
                 subject: row.get(5).ok(),
                 date: row.get(6).ok(),
-                body: row.get(7).ok(),
+                body: Self::get_compressed_text(&row, 7),
                 to: row.get(8).ok(),
                 cc: row.get(9).ok(),
                 git_blob_hash: row.get(10).ok(),
@@ -2841,8 +2878,8 @@ impl Database {
                     "output": r.get::<Option<String>>(3).ok(),
                     "result": r.get::<Option<String>>(4).ok(),
                     "status": r.get::<Option<String>>(5).ok(),
-                    "inline_review": r.get::<Option<String>>(6).ok(),
-                    "logs": r.get::<Option<String>>(7).ok(),
+                    "inline_review": Self::get_compressed_text(&r, 6),
+                    "logs": Self::get_compressed_text(&r, 7),
                     "tokens_in": r.get::<Option<u32>>(8).ok(),
                     "tokens_out": r.get::<Option<u32>>(9).ok(),
                     "patch_id": r.get::<Option<i64>>(10).ok(),
@@ -3082,7 +3119,7 @@ impl Database {
                     "output": r.get::<Option<String>>(2).ok(),
                     "result": r.get::<Option<String>>(3).ok(),
                     "status": r.get::<Option<String>>(4).ok(),
-                    "inline_review": r.get::<Option<String>>(5).ok(),
+                    "inline_review": Self::get_compressed_text(&r, 5),
                     "tokens_in": r.get::<Option<u32>>(6).ok(),
                     "tokens_out": r.get::<Option<u32>>(7).ok(),
                     "patch_id": r.get::<Option<i64>>(8).ok(),
@@ -3250,7 +3287,7 @@ impl Database {
                 "model": r.get::<Option<String>>(1).ok(),
                 "summary": r.get::<Option<String>>(2).ok(),
                 "created_at": r.get::<Option<i64>>(3).ok(),
-                "input": r.get::<Option<String>>(4).ok(),
+                "input": Self::get_compressed_text(&r, 4),
                 "output": r.get::<Option<String>>(5).ok(),
                 "baseline": {
                     "repo_url": r.get::<Option<String>>(6).ok(),
@@ -3261,8 +3298,8 @@ impl Database {
                 "prompts_hash": r.get::<Option<String>>(10).ok(),
                 "result": r.get::<Option<String>>(11).ok(),
                 "status": r.get::<Option<String>>(12).ok(),
-                "inline_review": r.get::<Option<String>>(13).ok(),
-                "logs": r.get::<Option<String>>(14).ok(),
+                "inline_review": Self::get_compressed_text(&r, 13),
+                "logs": Self::get_compressed_text(&r, 14),
                 "tokens_in": r.get::<Option<u32>>(15).ok(),
                 "tokens_out": r.get::<Option<u32>>(16).ok(),
                 "patch_id": r.get::<Option<i64>>(17).ok(),
@@ -3313,7 +3350,7 @@ impl Database {
         while let Ok(Some(row)) = rows.next().await {
             let id: i64 = row.get(0)?;
             let index: i64 = row.get(1).unwrap_or(0);
-            let diff: String = row.get(2)?;
+            let diff: String = Self::get_compressed_text(&row, 2).unwrap_or_default();
             let subject: String = row.get(3).unwrap_or_default();
             let author: String = row.get(4).unwrap_or_default();
             let date: i64 = row.get(5).unwrap_or(0);
@@ -3449,7 +3486,7 @@ impl Database {
         while let Ok(Some(row)) = rows.next().await {
             let review_id: i64 = row.get(0)?;
             let patch_id: i64 = row.get(1)?;
-            let inline_review: String = row.get(2).unwrap_or_default();
+            let inline_review: String = Self::get_compressed_text(&row, 2).unwrap_or_default();
             let summary: String = row.get(3).unwrap_or_default();
             let patch_message_id: String = row.get(4).unwrap_or_default();
             let index: i64 = row.get(5).unwrap_or_default();
@@ -3726,7 +3763,7 @@ impl Database {
         self.conn
             .execute(
                 "UPDATE patchsets SET baseline_id = ?, model_name = ?, prompts_git_hash = ?, baseline_logs = ?, provider = ? WHERE id = ?",
-                libsql::params![baseline_id, model_name, prompts_hash, logs, provider, id],
+                libsql::params![baseline_id, model_name, prompts_hash, Self::compress_opt_text(logs), provider, id],
             )
             .await?;
         Ok(())

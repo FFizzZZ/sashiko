@@ -12,7 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use anyhow::Result;
+use flate2::Compression;
+use flate2::read::ZlibDecoder;
+use flate2::write::ZlibEncoder;
 use regex::Regex;
+use std::io::{Read, Write};
 use std::sync::OnceLock;
 
 static KEY_REGEX: OnceLock<Regex> = OnceLock::new();
@@ -84,6 +89,21 @@ pub fn clean_json_string(input: &str) -> String {
     out
 }
 
+/// Compresses text using Zlib into a binary vector.
+pub fn compress_text(text: &str) -> Result<Vec<u8>> {
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(text.as_bytes())?;
+    Ok(encoder.finish()?)
+}
+
+/// Decompresses Zlib-compressed binary data into a string.
+pub fn decompress_text(data: &[u8]) -> Result<String> {
+    let mut decoder = ZlibDecoder::new(data);
+    let mut string = String::new();
+    decoder.read_to_string(&mut string)?;
+    Ok(string)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,5 +160,14 @@ mod tests {
 
         let structural = "{\n  \"key\": \"value\"\n}";
         assert_eq!(clean_json_string(structural), structural);
+    }
+
+    #[test]
+    fn test_compress_and_decompress() {
+        let original = "Hello world! This is a test payload with repetitive data repetitive data repetitive data.";
+        let compressed = compress_text(original).unwrap();
+        assert!(compressed.len() < original.len());
+        let decompressed = decompress_text(&compressed).unwrap();
+        assert_eq!(decompressed, original);
     }
 }
