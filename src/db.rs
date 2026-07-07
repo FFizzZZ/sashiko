@@ -2750,7 +2750,7 @@ impl Database {
             let failed_reason: Option<String> = row.get(11).ok();
             let model_name: Option<String> = row.get(12).ok();
             let prompts_git_hash: Option<String> = row.get(13).ok();
-            let baseline_logs: Option<String> = row.get(14).ok();
+            let baseline_logs: Option<String> = Self::get_compressed_text(&row, 14);
             let baseline_id: Option<i64> = row.get(15).ok();
             let provider: Option<String> = row.get(16).ok();
             let embargo_until: Option<i64> = row.get(17).ok();
@@ -2884,7 +2884,7 @@ impl Database {
                 reviews.push(serde_json::json!({
                     "summary": r.get::<Option<String>>(0).ok(),
                     "created_at": r.get::<Option<i64>>(1).ok(),
-                    "output": r.get::<Option<String>>(3).ok(),
+                    "output": Self::get_compressed_text(&r, 3),
                     "result": r.get::<Option<String>>(4).ok(),
                     "status": r.get::<Option<String>>(5).ok(),
                     "inline_review": Self::get_compressed_text(&r, 6),
@@ -2995,7 +2995,7 @@ impl Database {
             let failed_reason: Option<String> = row.get(11).ok();
             let model_name: Option<String> = row.get(12).ok();
             let prompts_git_hash: Option<String> = row.get(13).ok();
-            let baseline_logs: Option<String> = row.get(14).ok();
+            let baseline_logs: Option<String> = Self::get_compressed_text(&row, 14);
             let baseline_id: Option<i64> = row.get(15).ok();
             let provider: Option<String> = row.get(16).ok();
             let embargo_until: Option<i64> = row.get(17).ok();
@@ -3125,7 +3125,7 @@ impl Database {
                 reviews.push(serde_json::json!({
                     "summary": r.get::<Option<String>>(0).ok(),
                     "created_at": r.get::<Option<i64>>(1).ok(),
-                    "output": r.get::<Option<String>>(2).ok(),
+                    "output": Self::get_compressed_text(&r, 2),
                     "result": r.get::<Option<String>>(3).ok(),
                     "status": r.get::<Option<String>>(4).ok(),
                     "inline_review": Self::get_compressed_text(&r, 5),
@@ -3297,7 +3297,7 @@ impl Database {
                 "summary": r.get::<Option<String>>(2).ok(),
                 "created_at": r.get::<Option<i64>>(3).ok(),
                 "input": Self::get_compressed_text(&r, 4),
-                "output": r.get::<Option<String>>(5).ok(),
+                "output": Self::get_compressed_text(&r, 5),
                 "baseline": {
                     "repo_url": r.get::<Option<String>>(6).ok(),
                     "branch": r.get::<Option<String>>(7).ok(),
@@ -4557,10 +4557,22 @@ impl Database {
     }
 
     pub async fn vacuum(&self) -> Result<()> {
-        tracing::info!("Starting database VACUUM. This may take several minutes...");
-        self.conn.execute("VACUUM", ()).await?;
-        tracing::info!("Database VACUUM completed successfully.");
-        Ok(())
+        tracing::warn!(
+            "Starting database VACUUM. Note: VACUUM requires temporary disk space equal to the database file size and acquires an Exclusive Lock across all workers."
+        );
+        match self.conn.execute("VACUUM", ()).await {
+            Ok(_) => {
+                tracing::info!("Database VACUUM completed successfully.");
+                Ok(())
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Database VACUUM failed (possibly due to concurrent lock conflict or insufficient temporary disk space): {}",
+                    e
+                );
+                Err(e.into())
+            }
+        }
     }
 }
 
@@ -6999,6 +7011,64 @@ mod tests {
         assert_eq!(
             batch_5, 0,
             "Expected 0 when all tables are completely checked and compressed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_decompression_on_compressed_rows_in_queries() {
+        let db = setup_db().await;
+
+        db.conn
+            .execute(
+                "INSERT INTO patchsets (id, status, date, baseline_logs) VALUES (1, 'Test', 100, 'long baseline log string that should compress nicely')",
+                (),
+            )
+            .await
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO ai_interactions (id, provider, model, input_context, output_raw) VALUES ('ai_1', 'test', 'test', 'in', '{\"concerns_count\": 5, \"text\": \"long ai output\"}')",
+                (),
+            )
+            .await
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO reviews (id, patchset_id, status, created_at, provider, model, interaction_id) VALUES (1, 1, 'In Review', 100, 'test', 'test', 'ai_1')",
+                (),
+            )
+            .await
+            .unwrap();
+
+        // Compress patchsets and ai_interactions using our incremental batch tool
+        while db.compress_legacy_batch(100).await.unwrap() > 0 {}
+
+        // Verify baseline_logs decompression in get_patchset_details and get_patchset_summary
+        let details = db
+            .get_patchset_details(1, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            details["baseline_logs"].as_str(),
+            Some("long baseline log string that should compress nicely")
+        );
+
+        let summary = db
+            .get_patchset_summary(1, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            summary["baseline_logs"].as_str(),
+            Some("long baseline log string that should compress nicely")
+        );
+
+        // Verify output_raw decompression in get_review_details
+        let rev_details = db.get_review_details(1).await.unwrap().unwrap();
+        assert_eq!(
+            rev_details["output"].as_str().unwrap(),
+            "{\"concerns_count\": 5, \"text\": \"long ai output\"}"
         );
     }
 }
