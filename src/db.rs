@@ -668,6 +668,15 @@ impl Database {
                 "strftime('%Y-%m-%d', created_at, 'unixepoch'), status",
             )
             .await;
+
+        let _ = self
+            .conn
+            .execute(
+                "CREATE TABLE IF NOT EXISTS app_metadata (key TEXT PRIMARY KEY, value TEXT)",
+                (),
+            )
+            .await;
+
         Ok(())
     }
 
@@ -4111,227 +4120,381 @@ impl Database {
         Ok(())
     }
 
-    pub async fn compress_legacy_reviews(&self, batch_size: usize) -> Result<usize> {
-        let mut total_migrated = 0;
-        loop {
-            let mut batch = Vec::new();
-            {
-                let mut rows = self
-                    .conn
-                    .query(
-                        &format!(
-                            "SELECT id, logs, inline_review FROM reviews WHERE (typeof(logs) = 'text' AND logs IS NOT NULL) OR (typeof(inline_review) = 'text' AND inline_review IS NOT NULL) LIMIT {}",
-                            batch_size
-                        ),
-                        (),
-                    )
-                    .await?;
-                while let Ok(Some(row)) = rows.next().await {
-                    let id: i64 = row.get(0)?;
-                    let logs: Option<String> = row.get(1).ok();
-                    let inline: Option<String> = row.get(2).ok();
-                    batch.push((id, logs, inline));
+    async fn get_compression_cursor(&self, key: &str) -> i64 {
+        let mut rows = match self
+            .conn
+            .query(
+                "SELECT value FROM app_metadata WHERE key = ?",
+                libsql::params![key],
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => return -1,
+        };
+        if let Ok(Some(row)) = rows.next().await
+            && let Ok(s) = row.get::<String>(0)
+        {
+            return s.parse::<i64>().unwrap_or(-1);
+        }
+        -1
+    }
+
+    async fn set_compression_cursor(&self, key: &str, val: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO app_metadata (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            libsql::params![key, val.to_string()],
+        ).await?;
+        Ok(())
+    }
+
+    async fn get_compression_cursor_str(&self, key: &str) -> String {
+        let mut rows = match self
+            .conn
+            .query(
+                "SELECT value FROM app_metadata WHERE key = ?",
+                libsql::params![key],
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => return String::new(),
+        };
+        if let Ok(Some(row)) = rows.next().await
+            && let Ok(s) = row.get::<String>(0)
+        {
+            return s;
+        }
+        String::new()
+    }
+
+    async fn set_compression_cursor_str(&self, key: &str, val: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO app_metadata (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            libsql::params![key, val],
+        ).await?;
+        Ok(())
+    }
+
+    /// Incremental batch compressor designed for background execution inside `sashiko`.
+    /// Scans up to `limit` rows starting from the last checked rowid in `app_metadata` (`WHERE id > last_id ORDER BY id LIMIT limit`).
+    /// Compresses any legacy uncompressed strings (`typeof(col) = 'text'`) and updates them inside `BEGIN IMMEDIATE ... COMMIT`.
+    /// Returns the number of rows scanned in this batch (`0` when all 5 tables reach the very end of their IDs).
+    pub async fn compress_legacy_batch(&self, limit: usize) -> Result<usize> {
+        // 1. Check reviews
+        let last_id = self
+            .get_compression_cursor("compression_last_id_reviews")
+            .await;
+        let mut rows = self.conn.query(
+            &format!("SELECT id, logs, inline_review FROM reviews WHERE id > {} ORDER BY id LIMIT {}", last_id, limit),
+            ()
+        ).await?;
+        let mut batch_reviews = Vec::new();
+        let mut max_id = last_id;
+        while let Ok(Some(row)) = rows.next().await {
+            let id: i64 = match row.get_value(0) {
+                Ok(libsql::Value::Integer(i)) => i,
+                Ok(libsql::Value::Text(s)) => s.parse().unwrap_or(0),
+                _ => continue,
+            };
+            if id > max_id {
+                max_id = id;
+            }
+            let logs: Option<String> = match row.get_value(1) {
+                Ok(libsql::Value::Text(s)) => Some(s),
+                _ => None,
+            };
+            let inline: Option<String> = match row.get_value(2) {
+                Ok(libsql::Value::Text(s)) => Some(s),
+                _ => None,
+            };
+            batch_reviews.push((id, logs, inline));
+        }
+        if !batch_reviews.is_empty() {
+            let scanned = batch_reviews.len();
+            let mut to_update = Vec::new();
+            for (id, logs, inline) in batch_reviews {
+                if logs.is_some() || inline.is_some() {
+                    to_update.push((id, logs, inline));
                 }
             }
-            if batch.is_empty() {
+            if !to_update.is_empty() {
+                self.conn.execute("BEGIN IMMEDIATE", ()).await?;
+                for (id, logs, inline) in to_update {
+                    let logs_val = Self::compress_opt_text(logs.as_deref());
+                    let inline_val = Self::compress_opt_text(inline.as_deref());
+                    self.conn
+                        .execute(
+                            "UPDATE reviews SET logs = ?, inline_review = ? WHERE id = ?",
+                            libsql::params![logs_val, inline_val, id],
+                        )
+                        .await?;
+                }
+                self.conn.execute("COMMIT", ()).await?;
+            }
+            self.set_compression_cursor("compression_last_id_reviews", max_id)
+                .await?;
+            return Ok(scanned);
+        }
+
+        // 2. Check messages
+        let last_id = self
+            .get_compression_cursor("compression_last_id_messages")
+            .await;
+        let mut rows = self
+            .conn
+            .query(
+                &format!(
+                    "SELECT id, body FROM messages WHERE id > {} ORDER BY id LIMIT {}",
+                    last_id, limit
+                ),
+                (),
+            )
+            .await?;
+        let mut batch_messages = Vec::new();
+        let mut max_id = last_id;
+        while let Ok(Some(row)) = rows.next().await {
+            let id: i64 = match row.get_value(0) {
+                Ok(libsql::Value::Integer(i)) => i,
+                Ok(libsql::Value::Text(s)) => s.parse().unwrap_or(0),
+                _ => continue,
+            };
+            if id > max_id {
+                max_id = id;
+            }
+            let body: Option<String> = match row.get_value(1) {
+                Ok(libsql::Value::Text(s)) => Some(s),
+                _ => None,
+            };
+            batch_messages.push((id, body));
+        }
+        if !batch_messages.is_empty() {
+            let scanned = batch_messages.len();
+            let mut to_update = Vec::new();
+            for (id, body) in batch_messages {
+                if let Some(s) = body {
+                    to_update.push((id, s));
+                }
+            }
+            if !to_update.is_empty() {
+                self.conn.execute("BEGIN IMMEDIATE", ()).await?;
+                for (id, body) in to_update {
+                    let body_val = Self::compress_str_to_value(&body);
+                    self.conn
+                        .execute(
+                            "UPDATE messages SET body = ? WHERE id = ?",
+                            libsql::params![body_val, id],
+                        )
+                        .await?;
+                }
+                self.conn.execute("COMMIT", ()).await?;
+            }
+            self.set_compression_cursor("compression_last_id_messages", max_id)
+                .await?;
+            return Ok(scanned);
+        }
+
+        // 3. Check patches
+        let last_id = self
+            .get_compression_cursor("compression_last_id_patches")
+            .await;
+        let mut rows = self
+            .conn
+            .query(
+                &format!(
+                    "SELECT id, diff FROM patches WHERE id > {} ORDER BY id LIMIT {}",
+                    last_id, limit
+                ),
+                (),
+            )
+            .await?;
+        let mut batch_patches = Vec::new();
+        let mut max_id = last_id;
+        while let Ok(Some(row)) = rows.next().await {
+            let id: i64 = match row.get_value(0) {
+                Ok(libsql::Value::Integer(i)) => i,
+                Ok(libsql::Value::Text(s)) => s.parse().unwrap_or(0),
+                _ => continue,
+            };
+            if id > max_id {
+                max_id = id;
+            }
+            let diff: Option<String> = match row.get_value(1) {
+                Ok(libsql::Value::Text(s)) => Some(s),
+                _ => None,
+            };
+            batch_patches.push((id, diff));
+        }
+        if !batch_patches.is_empty() {
+            let scanned = batch_patches.len();
+            let mut to_update = Vec::new();
+            for (id, diff) in batch_patches {
+                if let Some(s) = diff {
+                    to_update.push((id, s));
+                }
+            }
+            if !to_update.is_empty() {
+                self.conn.execute("BEGIN IMMEDIATE", ()).await?;
+                for (id, diff) in to_update {
+                    let diff_val = Self::compress_str_to_value(&diff);
+                    self.conn
+                        .execute(
+                            "UPDATE patches SET diff = ? WHERE id = ?",
+                            libsql::params![diff_val, id],
+                        )
+                        .await?;
+                }
+                self.conn.execute("COMMIT", ()).await?;
+            }
+            self.set_compression_cursor("compression_last_id_patches", max_id)
+                .await?;
+            return Ok(scanned);
+        }
+
+        // 4. Check ai_interactions
+        let last_id = self
+            .get_compression_cursor_str("compression_last_id_ai_interactions")
+            .await;
+        let mut rows = self.conn.query(
+            &format!("SELECT id, output_raw FROM ai_interactions WHERE id > '{}' ORDER BY id LIMIT {}", last_id, limit),
+            ()
+        ).await?;
+        let mut batch_ai = Vec::new();
+        let mut max_id = last_id.clone();
+        while let Ok(Some(row)) = rows.next().await {
+            let id: String = match row.get_value(0) {
+                Ok(libsql::Value::Text(s)) => s,
+                Ok(libsql::Value::Integer(i)) => i.to_string(),
+                _ => continue,
+            };
+            if id > max_id {
+                max_id = id.clone();
+            }
+            let output: Option<String> = match row.get_value(1) {
+                Ok(libsql::Value::Text(s)) => Some(s),
+                _ => None,
+            };
+            batch_ai.push((id, output));
+        }
+        if !batch_ai.is_empty() {
+            let scanned = batch_ai.len();
+            let mut to_update = Vec::new();
+            for (id, output) in batch_ai {
+                if let Some(s) = output {
+                    to_update.push((id, s));
+                }
+            }
+            if !to_update.is_empty() {
+                self.conn.execute("BEGIN IMMEDIATE", ()).await?;
+                for (id, output) in to_update {
+                    let output_val = Self::compress_str_to_value(&output);
+                    self.conn
+                        .execute(
+                            "UPDATE ai_interactions SET output_raw = ? WHERE id = ?",
+                            libsql::params![output_val, id],
+                        )
+                        .await?;
+                }
+                self.conn.execute("COMMIT", ()).await?;
+            }
+            self.set_compression_cursor_str("compression_last_id_ai_interactions", &max_id)
+                .await?;
+            return Ok(scanned);
+        }
+
+        // 5. Check patchsets
+        let last_id = self
+            .get_compression_cursor("compression_last_id_patchsets")
+            .await;
+        let mut rows = self
+            .conn
+            .query(
+                &format!(
+                    "SELECT id, baseline_logs FROM patchsets WHERE id > {} ORDER BY id LIMIT {}",
+                    last_id, limit
+                ),
+                (),
+            )
+            .await?;
+        let mut batch_patchsets = Vec::new();
+        let mut max_id = last_id;
+        while let Ok(Some(row)) = rows.next().await {
+            let id: i64 = match row.get_value(0) {
+                Ok(libsql::Value::Integer(i)) => i,
+                Ok(libsql::Value::Text(s)) => s.parse().unwrap_or(0),
+                _ => continue,
+            };
+            if id > max_id {
+                max_id = id;
+            }
+            let logs: Option<String> = match row.get_value(1) {
+                Ok(libsql::Value::Text(s)) => Some(s),
+                _ => None,
+            };
+            batch_patchsets.push((id, logs));
+        }
+        if !batch_patchsets.is_empty() {
+            let scanned = batch_patchsets.len();
+            let mut to_update = Vec::new();
+            for (id, logs) in batch_patchsets {
+                if let Some(s) = logs {
+                    to_update.push((id, s));
+                }
+            }
+            if !to_update.is_empty() {
+                self.conn.execute("BEGIN IMMEDIATE", ()).await?;
+                for (id, logs) in to_update {
+                    let logs_val = Self::compress_str_to_value(&logs);
+                    self.conn
+                        .execute(
+                            "UPDATE patchsets SET baseline_logs = ? WHERE id = ?",
+                            libsql::params![logs_val, id],
+                        )
+                        .await?;
+                }
+                self.conn.execute("COMMIT", ()).await?;
+            }
+            self.set_compression_cursor("compression_last_id_patchsets", max_id)
+                .await?;
+            return Ok(scanned);
+        }
+
+        tracing::info!(
+            "Database historical data background compression check complete. All legacy rows across all 5 tables are compressed."
+        );
+        Ok(0)
+    }
+
+    pub async fn compress_legacy_reviews(&self, batch_size: usize) -> Result<usize> {
+        let mut total = 0;
+        loop {
+            let n = self.compress_legacy_batch(batch_size).await?;
+            if n == 0 {
                 break;
             }
-            let batch_len = batch.len();
-            for (id, logs, inline_review) in batch {
-                let logs_val = Self::compress_opt_text(logs.as_deref());
-                let inline_val = Self::compress_opt_text(inline_review.as_deref());
-                self.conn
-                    .execute(
-                        "UPDATE reviews SET logs = ?, inline_review = ? WHERE id = ?",
-                        libsql::params![logs_val, inline_val, id],
-                    )
-                    .await?;
-            }
-            total_migrated += batch_len;
-            tracing::info!(
-                "Migrated {} legacy rows in reviews table...",
-                total_migrated
-            );
+            total += n;
         }
-        Ok(total_migrated)
+        Ok(total)
     }
 
     pub async fn compress_legacy_messages(&self, batch_size: usize) -> Result<usize> {
-        let mut total_migrated = 0;
-        loop {
-            let mut batch = Vec::new();
-            {
-                let mut rows = self
-                    .conn
-                    .query(
-                        &format!(
-                            "SELECT id, body FROM messages WHERE typeof(body) = 'text' AND body IS NOT NULL LIMIT {}",
-                            batch_size
-                        ),
-                        (),
-                    )
-                    .await?;
-                while let Ok(Some(row)) = rows.next().await {
-                    let id: i64 = row.get(0)?;
-                    let body: String = row.get(1)?;
-                    batch.push((id, body));
-                }
-            }
-            if batch.is_empty() {
-                break;
-            }
-            let batch_len = batch.len();
-            for (id, body) in batch {
-                self.conn
-                    .execute(
-                        "UPDATE messages SET body = ? WHERE id = ?",
-                        libsql::params![Self::compress_str_to_value(&body), id],
-                    )
-                    .await?;
-            }
-            total_migrated += batch_len;
-            tracing::info!(
-                "Migrated {} legacy rows in messages table...",
-                total_migrated
-            );
-        }
-        Ok(total_migrated)
+        self.compress_legacy_reviews(batch_size).await
     }
 
     pub async fn compress_legacy_patches(&self, batch_size: usize) -> Result<usize> {
-        let mut total_migrated = 0;
-        loop {
-            let mut batch = Vec::new();
-            {
-                let mut rows = self
-                    .conn
-                    .query(
-                        &format!(
-                            "SELECT id, diff FROM patches WHERE typeof(diff) = 'text' AND diff IS NOT NULL LIMIT {}",
-                            batch_size
-                        ),
-                        (),
-                    )
-                    .await?;
-                while let Ok(Some(row)) = rows.next().await {
-                    let id: i64 = row.get(0)?;
-                    let diff: String = row.get(1)?;
-                    batch.push((id, diff));
-                }
-            }
-            if batch.is_empty() {
-                break;
-            }
-            let batch_len = batch.len();
-            for (id, diff) in batch {
-                self.conn
-                    .execute(
-                        "UPDATE patches SET diff = ? WHERE id = ?",
-                        libsql::params![Self::compress_str_to_value(&diff), id],
-                    )
-                    .await?;
-            }
-            total_migrated += batch_len;
-            tracing::info!(
-                "Migrated {} legacy rows in patches table...",
-                total_migrated
-            );
-        }
-        Ok(total_migrated)
+        self.compress_legacy_reviews(batch_size).await
     }
 
     pub async fn compress_legacy_ai_interactions(&self, batch_size: usize) -> Result<usize> {
-        let mut total_migrated = 0;
-        loop {
-            let mut batch = Vec::new();
-            {
-                let mut rows = self
-                    .conn
-                    .query(
-                        &format!(
-                            "SELECT id, output_raw FROM ai_interactions WHERE typeof(output_raw) = 'text' AND output_raw IS NOT NULL LIMIT {}",
-                            batch_size
-                        ),
-                        (),
-                    )
-                    .await?;
-                while let Ok(Some(row)) = rows.next().await {
-                    let id: String = row.get(0)?;
-                    let output: String = row.get(1)?;
-                    batch.push((id, output));
-                }
-            }
-            if batch.is_empty() {
-                break;
-            }
-            let batch_len = batch.len();
-            for (id, output) in batch {
-                self.conn
-                    .execute(
-                        "UPDATE ai_interactions SET output_raw = ? WHERE id = ?",
-                        libsql::params![Self::compress_str_to_value(&output), id],
-                    )
-                    .await?;
-            }
-            total_migrated += batch_len;
-            tracing::info!(
-                "Migrated {} legacy rows in ai_interactions table...",
-                total_migrated
-            );
-        }
-        Ok(total_migrated)
+        self.compress_legacy_reviews(batch_size).await
     }
 
     pub async fn compress_legacy_patchsets(&self, batch_size: usize) -> Result<usize> {
-        let mut total_migrated = 0;
-        loop {
-            let mut batch = Vec::new();
-            {
-                let mut rows = self
-                    .conn
-                    .query(
-                        &format!(
-                            "SELECT id, baseline_logs FROM patchsets WHERE typeof(baseline_logs) = 'text' AND baseline_logs IS NOT NULL LIMIT {}",
-                            batch_size
-                        ),
-                        (),
-                    )
-                    .await?;
-                while let Ok(Some(row)) = rows.next().await {
-                    let id: i64 = row.get(0)?;
-                    let logs: String = row.get(1)?;
-                    batch.push((id, logs));
-                }
-            }
-            if batch.is_empty() {
-                break;
-            }
-            let batch_len = batch.len();
-            for (id, logs) in batch {
-                self.conn
-                    .execute(
-                        "UPDATE patchsets SET baseline_logs = ? WHERE id = ?",
-                        libsql::params![Self::compress_str_to_value(&logs), id],
-                    )
-                    .await?;
-            }
-            total_migrated += batch_len;
-            tracing::info!(
-                "Migrated {} legacy rows in patchsets table...",
-                total_migrated
-            );
-        }
-        Ok(total_migrated)
+        self.compress_legacy_reviews(batch_size).await
     }
 
     pub async fn compress_legacy_data(&self, batch_size: usize) -> Result<usize> {
-        let mut total = 0;
-        total += self.compress_legacy_reviews(batch_size).await?;
-        total += self.compress_legacy_messages(batch_size).await?;
-        total += self.compress_legacy_patches(batch_size).await?;
-        total += self.compress_legacy_ai_interactions(batch_size).await?;
-        total += self.compress_legacy_patchsets(batch_size).await?;
-        Ok(total)
+        self.compress_legacy_reviews(batch_size).await
     }
 
     pub async fn vacuum(&self) -> Result<()> {

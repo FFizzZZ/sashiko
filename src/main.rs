@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
 use tokio::sync::{Semaphore, mpsc};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
 
 const DEFAULT_SETTINGS: &str = include_str!("../docs/examples/Settings.example.toml");
@@ -822,6 +822,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let reviewer = Reviewer::new(db.clone(), settings.clone()).await;
     tokio::spawn(async move {
         reviewer.start().await;
+    });
+
+    // Start Background Historical Data Compression Worker
+    let compression_db = db.clone();
+    tokio::spawn(async move {
+        info!("Background historical data compression worker started");
+        loop {
+            match compression_db.compress_legacy_batch(500).await {
+                Ok(0) => {
+                    info!(
+                        "Historical data compression is 100% complete across all database tables (reviews, messages, patches, ai_interactions, patchsets). Background compression worker sleeping for 24 hours."
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(86400)).await;
+                }
+                Ok(count) => {
+                    debug!(
+                        "Compressed batch of {} historical rows in background.",
+                        count
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                }
+                Err(e) => {
+                    warn!(
+                        "Background compression batch encountered an error: {}. Retrying in 60s...",
+                        e
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                }
+            }
+        }
     });
 
     let metrics_db = db.clone();
