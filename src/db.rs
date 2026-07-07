@@ -4110,6 +4110,236 @@ impl Database {
             .await?;
         Ok(())
     }
+
+    pub async fn compress_legacy_reviews(&self, batch_size: usize) -> Result<usize> {
+        let mut total_migrated = 0;
+        loop {
+            let mut batch = Vec::new();
+            {
+                let mut rows = self
+                    .conn
+                    .query(
+                        &format!(
+                            "SELECT id, logs, inline_review FROM reviews WHERE (typeof(logs) = 'text' AND logs IS NOT NULL) OR (typeof(inline_review) = 'text' AND inline_review IS NOT NULL) LIMIT {}",
+                            batch_size
+                        ),
+                        (),
+                    )
+                    .await?;
+                while let Ok(Some(row)) = rows.next().await {
+                    let id: i64 = row.get(0)?;
+                    let logs: Option<String> = row.get(1).ok();
+                    let inline: Option<String> = row.get(2).ok();
+                    batch.push((id, logs, inline));
+                }
+            }
+            if batch.is_empty() {
+                break;
+            }
+            let batch_len = batch.len();
+            for (id, logs, inline_review) in batch {
+                let logs_val = Self::compress_opt_text(logs.as_deref());
+                let inline_val = Self::compress_opt_text(inline_review.as_deref());
+                self.conn
+                    .execute(
+                        "UPDATE reviews SET logs = ?, inline_review = ? WHERE id = ?",
+                        libsql::params![logs_val, inline_val, id],
+                    )
+                    .await?;
+            }
+            total_migrated += batch_len;
+            tracing::info!(
+                "Migrated {} legacy rows in reviews table...",
+                total_migrated
+            );
+        }
+        Ok(total_migrated)
+    }
+
+    pub async fn compress_legacy_messages(&self, batch_size: usize) -> Result<usize> {
+        let mut total_migrated = 0;
+        loop {
+            let mut batch = Vec::new();
+            {
+                let mut rows = self
+                    .conn
+                    .query(
+                        &format!(
+                            "SELECT id, body FROM messages WHERE typeof(body) = 'text' AND body IS NOT NULL LIMIT {}",
+                            batch_size
+                        ),
+                        (),
+                    )
+                    .await?;
+                while let Ok(Some(row)) = rows.next().await {
+                    let id: i64 = row.get(0)?;
+                    let body: String = row.get(1)?;
+                    batch.push((id, body));
+                }
+            }
+            if batch.is_empty() {
+                break;
+            }
+            let batch_len = batch.len();
+            for (id, body) in batch {
+                self.conn
+                    .execute(
+                        "UPDATE messages SET body = ? WHERE id = ?",
+                        libsql::params![Self::compress_str_to_value(&body), id],
+                    )
+                    .await?;
+            }
+            total_migrated += batch_len;
+            tracing::info!(
+                "Migrated {} legacy rows in messages table...",
+                total_migrated
+            );
+        }
+        Ok(total_migrated)
+    }
+
+    pub async fn compress_legacy_patches(&self, batch_size: usize) -> Result<usize> {
+        let mut total_migrated = 0;
+        loop {
+            let mut batch = Vec::new();
+            {
+                let mut rows = self
+                    .conn
+                    .query(
+                        &format!(
+                            "SELECT id, diff FROM patches WHERE typeof(diff) = 'text' AND diff IS NOT NULL LIMIT {}",
+                            batch_size
+                        ),
+                        (),
+                    )
+                    .await?;
+                while let Ok(Some(row)) = rows.next().await {
+                    let id: i64 = row.get(0)?;
+                    let diff: String = row.get(1)?;
+                    batch.push((id, diff));
+                }
+            }
+            if batch.is_empty() {
+                break;
+            }
+            let batch_len = batch.len();
+            for (id, diff) in batch {
+                self.conn
+                    .execute(
+                        "UPDATE patches SET diff = ? WHERE id = ?",
+                        libsql::params![Self::compress_str_to_value(&diff), id],
+                    )
+                    .await?;
+            }
+            total_migrated += batch_len;
+            tracing::info!(
+                "Migrated {} legacy rows in patches table...",
+                total_migrated
+            );
+        }
+        Ok(total_migrated)
+    }
+
+    pub async fn compress_legacy_ai_interactions(&self, batch_size: usize) -> Result<usize> {
+        let mut total_migrated = 0;
+        loop {
+            let mut batch = Vec::new();
+            {
+                let mut rows = self
+                    .conn
+                    .query(
+                        &format!(
+                            "SELECT id, output_raw FROM ai_interactions WHERE typeof(output_raw) = 'text' AND output_raw IS NOT NULL LIMIT {}",
+                            batch_size
+                        ),
+                        (),
+                    )
+                    .await?;
+                while let Ok(Some(row)) = rows.next().await {
+                    let id: String = row.get(0)?;
+                    let output: String = row.get(1)?;
+                    batch.push((id, output));
+                }
+            }
+            if batch.is_empty() {
+                break;
+            }
+            let batch_len = batch.len();
+            for (id, output) in batch {
+                self.conn
+                    .execute(
+                        "UPDATE ai_interactions SET output_raw = ? WHERE id = ?",
+                        libsql::params![Self::compress_str_to_value(&output), id],
+                    )
+                    .await?;
+            }
+            total_migrated += batch_len;
+            tracing::info!(
+                "Migrated {} legacy rows in ai_interactions table...",
+                total_migrated
+            );
+        }
+        Ok(total_migrated)
+    }
+
+    pub async fn compress_legacy_patchsets(&self, batch_size: usize) -> Result<usize> {
+        let mut total_migrated = 0;
+        loop {
+            let mut batch = Vec::new();
+            {
+                let mut rows = self
+                    .conn
+                    .query(
+                        &format!(
+                            "SELECT id, baseline_logs FROM patchsets WHERE typeof(baseline_logs) = 'text' AND baseline_logs IS NOT NULL LIMIT {}",
+                            batch_size
+                        ),
+                        (),
+                    )
+                    .await?;
+                while let Ok(Some(row)) = rows.next().await {
+                    let id: i64 = row.get(0)?;
+                    let logs: String = row.get(1)?;
+                    batch.push((id, logs));
+                }
+            }
+            if batch.is_empty() {
+                break;
+            }
+            let batch_len = batch.len();
+            for (id, logs) in batch {
+                self.conn
+                    .execute(
+                        "UPDATE patchsets SET baseline_logs = ? WHERE id = ?",
+                        libsql::params![Self::compress_str_to_value(&logs), id],
+                    )
+                    .await?;
+            }
+            total_migrated += batch_len;
+            tracing::info!(
+                "Migrated {} legacy rows in patchsets table...",
+                total_migrated
+            );
+        }
+        Ok(total_migrated)
+    }
+
+    pub async fn compress_legacy_data(&self, batch_size: usize) -> Result<usize> {
+        let mut total = 0;
+        total += self.compress_legacy_reviews(batch_size).await?;
+        total += self.compress_legacy_messages(batch_size).await?;
+        total += self.compress_legacy_patches(batch_size).await?;
+        total += self.compress_legacy_ai_interactions(batch_size).await?;
+        total += self.compress_legacy_patchsets(batch_size).await?;
+        Ok(total)
+    }
+
+    pub async fn vacuum(&self) -> Result<()> {
+        tracing::info!("Starting database VACUUM. This may take several minutes...");
+        self.conn.execute("VACUUM", ()).await?;
+        tracing::info!("Database VACUUM completed successfully.");
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -6391,5 +6621,97 @@ mod tests {
             ps1, ps2,
             "Patchset from B4 Relay devnull alias and real author email MUST merge"
         );
+    }
+
+    #[tokio::test]
+    async fn test_compress_legacy_data_and_vacuum() {
+        let db = setup_db().await;
+
+        db.conn
+            .execute(
+                "INSERT INTO patchsets (id, status, date, baseline_logs) VALUES (1, 'Test', 100, 'uncompressed baseline log')",
+                (),
+            )
+            .await
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO reviews (id, patchset_id, status, created_at, provider, model, logs, inline_review) VALUES (1, 1, 'In Review', 100, 'test', 'test', 'uncompressed review log', 'uncompressed inline')",
+                (),
+            )
+            .await
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO messages (id, message_id, body) VALUES (1, 'msg_1', 'uncompressed message body')",
+                (),
+            )
+            .await
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO patches (id, patchset_id, message_id, part_index, diff) VALUES (1, 1, 'msg_1', 1, 'uncompressed diff')",
+                (),
+            )
+            .await
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO ai_interactions (id, provider, model, input_context, output_raw) VALUES ('ai_1', 'test', 'test', 'in', 'uncompressed ai output')",
+                (),
+            )
+            .await
+            .unwrap();
+
+        {
+            let r = db
+                .conn
+                .query(
+                    "SELECT typeof(logs), typeof(inline_review) FROM reviews WHERE id = 1",
+                    (),
+                )
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(r.get::<String>(0).unwrap(), "text");
+            assert_eq!(r.get::<String>(1).unwrap(), "text");
+        }
+
+        let migrated = db.compress_legacy_data(100).await.unwrap();
+        assert_eq!(
+            migrated, 5,
+            "Expected 5 rows to be migrated across 5 tables"
+        );
+
+        {
+            let r = db
+                .conn
+                .query(
+                    "SELECT typeof(logs), typeof(inline_review) FROM reviews WHERE id = 1",
+                    (),
+                )
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(r.get::<String>(0).unwrap(), "blob");
+            assert_eq!(r.get::<String>(1).unwrap(), "blob");
+        }
+
+        {
+            let details = db.get_review_details(1).await.unwrap().unwrap();
+            assert_eq!(details["logs"].as_str().unwrap(), "uncompressed review log");
+            assert_eq!(
+                details["inline_review"].as_str().unwrap(),
+                "uncompressed inline"
+            );
+        }
+
+        db.vacuum().await.unwrap();
     }
 }
